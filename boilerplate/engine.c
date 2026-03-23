@@ -132,13 +132,90 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
             "Usage:\n"
-            "  %s supervisor <rootfs>\n"
-            "  %s start <id> <rootfs> <command>\n"
-            "  %s run <id> <rootfs> <command>\n"
+            "  %s supervisor <base-rootfs>\n"
+            "  %s start <id> <container-rootfs> <command> [--soft-mib N] [--hard-mib N] [--nice N]\n"
+            "  %s run <id> <container-rootfs> <command> [--soft-mib N] [--hard-mib N] [--nice N]\n"
             "  %s ps\n"
             "  %s logs <id>\n"
             "  %s stop <id>\n",
             prog, prog, prog, prog, prog, prog);
+}
+
+static int parse_mib_flag(const char *flag,
+                          const char *value,
+                          unsigned long *target_bytes)
+{
+    char *end = NULL;
+    unsigned long mib;
+
+    errno = 0;
+    mib = strtoul(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0') {
+        fprintf(stderr, "Invalid value for %s: %s\n", flag, value);
+        return -1;
+    }
+
+    if (mib > ULONG_MAX / (1UL << 20)) {
+        fprintf(stderr, "Value for %s is too large: %s\n", flag, value);
+        return -1;
+    }
+
+    *target_bytes = mib * (1UL << 20);
+    return 0;
+}
+
+static int parse_optional_flags(control_request_t *req,
+                                int argc,
+                                char *argv[],
+                                int start_index)
+{
+    int i;
+
+    for (i = start_index; i < argc; i += 2) {
+        char *end = NULL;
+        long nice_value;
+
+        if (i + 1 >= argc) {
+            fprintf(stderr, "Missing value for option: %s\n", argv[i]);
+            return -1;
+        }
+
+        if (strcmp(argv[i], "--soft-mib") == 0) {
+            if (parse_mib_flag("--soft-mib", argv[i + 1], &req->soft_limit_bytes) != 0)
+                return -1;
+            continue;
+        }
+
+        if (strcmp(argv[i], "--hard-mib") == 0) {
+            if (parse_mib_flag("--hard-mib", argv[i + 1], &req->hard_limit_bytes) != 0)
+                return -1;
+            continue;
+        }
+
+        if (strcmp(argv[i], "--nice") == 0) {
+            errno = 0;
+            nice_value = strtol(argv[i + 1], &end, 10);
+            if (errno != 0 || end == argv[i + 1] || *end != '\0' ||
+                nice_value < -20 || nice_value > 19) {
+                fprintf(stderr,
+                        "Invalid value for --nice (expected -20..19): %s\n",
+                        argv[i + 1]);
+                return -1;
+            }
+            req->nice_value = (int)nice_value;
+            continue;
+        }
+
+        fprintf(stderr, "Unknown option: %s\n", argv[i]);
+        return -1;
+    }
+
+    if (req->soft_limit_bytes > req->hard_limit_bytes) {
+        fprintf(stderr, "Invalid limits: soft limit cannot exceed hard limit\n");
+        return -1;
+    }
+
+    return 0;
 }
 
 static const char *state_to_string(container_state_t state)
@@ -342,7 +419,7 @@ static int run_supervisor(const char *rootfs)
      *   4) spawn the logger thread
      *   5) enter the supervisor event loop
      */
-    fprintf(stderr, "Supervisor mode not implemented yet for rootfs: %s\n", rootfs);
+    fprintf(stderr, "Supervisor mode not implemented yet for base-rootfs: %s\n", rootfs);
 
     bounded_buffer_begin_shutdown(&ctx.log_buffer);
     bounded_buffer_destroy(&ctx.log_buffer);
@@ -370,7 +447,9 @@ static int cmd_start(int argc, char *argv[])
     control_request_t req;
 
     if (argc < 5) {
-        fprintf(stderr, "Usage: %s start <id> <rootfs> <command>\n", argv[0]);
+        fprintf(stderr,
+                "Usage: %s start <id> <container-rootfs> <command> [--soft-mib N] [--hard-mib N] [--nice N]\n",
+                argv[0]);
         return 1;
     }
 
@@ -382,6 +461,9 @@ static int cmd_start(int argc, char *argv[])
     req.soft_limit_bytes = DEFAULT_SOFT_LIMIT;
     req.hard_limit_bytes = DEFAULT_HARD_LIMIT;
 
+    if (parse_optional_flags(&req, argc, argv, 5) != 0)
+        return 1;
+
     return send_control_request(&req);
 }
 
@@ -390,7 +472,9 @@ static int cmd_run(int argc, char *argv[])
     control_request_t req;
 
     if (argc < 5) {
-        fprintf(stderr, "Usage: %s run <id> <rootfs> <command>\n", argv[0]);
+        fprintf(stderr,
+                "Usage: %s run <id> <container-rootfs> <command> [--soft-mib N] [--hard-mib N] [--nice N]\n",
+                argv[0]);
         return 1;
     }
 
@@ -401,6 +485,9 @@ static int cmd_run(int argc, char *argv[])
     strncpy(req.command, argv[4], sizeof(req.command) - 1);
     req.soft_limit_bytes = DEFAULT_SOFT_LIMIT;
     req.hard_limit_bytes = DEFAULT_HARD_LIMIT;
+
+    if (parse_optional_flags(&req, argc, argv, 5) != 0)
+        return 1;
 
     return send_control_request(&req);
 }
@@ -467,7 +554,7 @@ int main(int argc, char *argv[])
 
     if (strcmp(argv[1], "supervisor") == 0) {
         if (argc < 3) {
-            fprintf(stderr, "Usage: %s supervisor <rootfs>\n", argv[0]);
+            fprintf(stderr, "Usage: %s supervisor <base-rootfs>\n", argv[0]);
             return 1;
         }
         return run_supervisor(argv[2]);

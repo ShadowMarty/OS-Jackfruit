@@ -43,12 +43,57 @@ sudo ./environment-check.sh
 Prepare the Alpine mini root filesystem:
 
 ```bash
-mkdir rootfs
+mkdir rootfs-base
 wget https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz
-tar -xzf alpine-minirootfs-3.20.3-x86_64.tar.gz -C rootfs
+tar -xzf alpine-minirootfs-3.20.3-x86_64.tar.gz -C rootfs-base
 ```
 
-No need to keep `rootfs/` in GitHub repo.
+Create one writable rootfs copy per container before launch:
+
+```bash
+cp -a ./rootfs-base ./rootfs-alpha
+cp -a ./rootfs-base ./rootfs-beta
+```
+
+No need to keep `rootfs-base/` or per-container `rootfs-*` directories in GitHub repo.
+
+---
+
+### Architecture Overview
+
+The runtime is a single binary (`engine`) used in two ways:
+
+1. **Supervisor daemon** — started once with `engine supervisor ./rootfs-base`. It stays alive, manages containers, and owns the logging pipeline.
+2. **CLI client** — each command like `engine start alpha ./rootfs-alpha /bin/sh` is a short-lived process that sends a request to the running supervisor and prints the response.
+
+The CLI process connects to the supervisor over an IPC control channel, sends a command, receives a response, and exits. The supervisor, upon receiving a `start` command, calls `clone()` to create a new container child process with its own namespaces. Each container's stdout and stderr are connected back to the supervisor via pipes, which feed into the bounded-buffer logging pipeline.
+
+There are two separate IPC paths in this project:
+
+- **Path A (logging):** Container stdout/stderr → Supervisor, via pipes. Described in Task 3.
+- **Path B (control):** CLI process → Supervisor, via a UNIX domain socket, FIFO, or shared-memory channel. Described in Task 2.
+
+### CLI Contract
+
+Use this exact command interface:
+
+```bash
+engine supervisor <base-rootfs>
+engine start <id> <container-rootfs> <command> [--soft-mib N] [--hard-mib N] [--nice N]
+engine run   <id> <container-rootfs> <command> [--soft-mib N] [--hard-mib N] [--nice N]
+engine ps
+engine logs <id>
+engine stop <id>
+```
+
+A few semantics:
+
+- `<container-rootfs>` must be unique per running container (no two live containers may share the same writable rootfs directory)
+- If `--soft-mib`/`--hard-mib` are omitted, default to `40 MiB` soft and `64 MiB` hard
+- `start` returns after the supervisor accepts the request and records metadata
+- `run` blocks until that container exits, then returns the container exit status (`exit_code`, or `128 + signal` if signaled)
+- `run` uses the same logging pipeline and log files as `start`; live terminal streaming is optional
+- If the `run` client receives `SIGINT`/`SIGTERM`, it must forward termination intent to the supervisor (equivalent to `stop <id>`) and continue waiting for final status
 
 ---
 
@@ -63,9 +108,21 @@ Demonstrate:
 - Supervisor process remains alive while containers run
 - Multiple containers can be started and tracked concurrently
 - Each container has isolated PID, UTS, and mount namespaces
-- Each container uses the provided `rootfs`
+- Each container uses its own rootfs copy derived from the provided base rootfs
 - `/proc` works correctly inside each container
 - Parent reaps exited children correctly with no zombies
+
+**Filesystem isolation:** Each container needs its own root filesystem view. Treat `rootfs-base/` as the template and run each container with a separate writable copy (for example `rootfs-alpha/`, `rootfs-beta/`). Do not run multiple live containers against the same writable rootfs directory. Use `chroot` (simpler) or `pivot_root` (more thorough — prevents escape via `..` traversal) to make the container see only its assigned `container-rootfs` directory as `/`. Inside the container, mount `/proc` so that tools like `ps` work:
+
+```c
+mount("proc", "/proc", "proc", 0, NULL);
+```
+
+To run helper binaries (e.g., test workloads) inside a container, copy them into that container's rootfs before launch (or copy into `rootfs-base` before creating per-container copies):
+
+```bash
+cp workload_binary ./rootfs-alpha/
+```
 
 For each container, the supervisor must maintain metadata in user space. At minimum track:
 
@@ -82,6 +139,8 @@ The internal representation is up to you to design, but it must be safe under co
 #### Task 2: Supervisor CLI and Signal Handling
 
 Implement a CLI interface for interacting with the supervisor.
+
+The command grammar and semantics in **Canonical CLI Contract (Required)** are mandatory.
 
 Required commands:
 
@@ -101,9 +160,13 @@ Demonstrate:
 - `SIGINT`/`SIGTERM` to the supervisor trigger orderly shutdown
 - Container termination path distinguishes graceful stop vs forced kill
 
-The control channel between the CLI client and the supervisor must use a second IPC mechanism different from the logging pipe. A UNIX domain socket, FIFO, or shared-memory-based command channel are all acceptable if justified.
+This task covers **Path B (control):** the IPC channel between the CLI client process and the supervisor daemon (see Architecture Overview). This channel must use a different IPC mechanism than the logging pipes in Task 3. A UNIX domain socket, FIFO, or shared-memory-based command channel are all acceptable if justified.
+
+The CLI process sends a command string (e.g., `start alpha ./rootfs-alpha /bin/sh --soft-mib 48 --hard-mib 80`) over this channel. The supervisor reads the command, acts on it, and sends a response back. Design the message format so the supervisor can parse the command type, required arguments, and optional flags.
 
 #### Task 3: Bounded-Buffer Logging and IPC Design
+
+This task covers **Path A (logging):** the pipe-based IPC from each container's stdout/stderr into the supervisor (see Architecture Overview).
 
 Capture container output through a concurrent logging pipeline rather than writing directly to the terminal.
 
@@ -118,9 +181,17 @@ Demonstrate:
 
 Minimum concurrency expectation:
 
-- At least one producer path inserts log data into a bounded shared buffer
-- At least one consumer thread removes data and writes to log files
+- At least one producer thread reads container output from pipes and inserts log data into a bounded shared buffer
+- At least one consumer thread removes data from the buffer and writes to log files
 - Shared metadata access is synchronized separately from the log buffer
+
+**Correctness properties you must demonstrate:**
+
+1. No log lines are dropped when a container exits abruptly
+2. The buffer does not deadlock when it is full and a container is trying to log
+3. Consumer threads observe a termination signal and flush all remaining entries before exiting
+
+**Design for cleanup now:** Your producer threads must exit cleanly when their container exits. Your consumer threads must be joinable. Do not defer this to Task 6 — if threads are not designed to shut down from the start, bolting cleanup on later will not work.
 
 Your README must explain:
 
@@ -152,6 +223,13 @@ Integration detail:
 - The supervisor must send the container's **host PID** to the kernel module
 - The user-space metadata must reflect whether a container exited normally, was stopped by the supervisor, or was killed due to the hard limit
 
+Required attribution rule for grading consistency:
+
+- The supervisor must set an internal `stop_requested` flag before signaling a container from `stop`
+- Classify termination as `stopped` when `stop_requested` is set and the container exits due to that stop flow
+- Classify termination as `hard_limit_killed` only when the exit signal is `SIGKILL` and `stop_requested` is not set
+- Keep the final reason in metadata so `ps` output can distinguish normal exit, manual stop, and hard-limit kill
+
 Exact event-reporting design is open to you. You may choose a simple `dmesg`-only design, or you may add a user-space notification path if you can justify it clearly.
 
 #### Task 5: Scheduler Experiments and Analysis
@@ -174,13 +252,15 @@ At least one experiment must compare:
 
 #### Task 6: Resource Cleanup
 
-Demonstrate clean teardown in both user and kernel space:
+By this point, cleanup logic should already be built into Tasks 1–4. This task is about verifying and demonstrating that teardown works end-to-end, not about designing it from scratch.
 
-- Child process reap in the supervisor
-- Logging threads exit and join correctly
+Verify clean teardown in both user and kernel space:
+
+- Child process reap in the supervisor (designed in Task 1)
+- Logging threads exit and join correctly (designed in Task 3)
 - File descriptors are closed on all paths
 - User-space heap resources are released
-- Kernel list entries are freed on module unload
+- Kernel list entries are freed on module unload (designed in Task 4)
 - No lingering zombie processes or stale metadata after demo run
 
 ---
@@ -253,11 +333,15 @@ sudo insmod monitor.ko
 ls -l /dev/container_monitor
 
 # Start supervisor
-sudo ./engine supervisor ./rootfs
+sudo ./engine supervisor ./rootfs-base
+
+# Create per-container writable rootfs copies
+cp -a ./rootfs-base ./rootfs-alpha
+cp -a ./rootfs-base ./rootfs-beta
 
 # In another terminal: start two containers
-sudo ./engine start alpha ./rootfs /bin/sh
-sudo ./engine start beta ./rootfs /bin/sh
+sudo ./engine start alpha ./rootfs-alpha /bin/sh --soft-mib 48 --hard-mib 80
+sudo ./engine start beta ./rootfs-beta /bin/sh --soft-mib 64 --hard-mib 96
 
 # List tracked containers
 sudo ./engine ps
@@ -284,10 +368,10 @@ dmesg | tail
 sudo rmmod monitor
 ```
 
-To run helper binaries inside the container, copy them into `rootfs/` before launching:
+To run helper binaries inside a container, copy them into that container's rootfs before launch:
 
 ```bash
-cp workload_binary ./rootfs/
+cp workload_binary ./rootfs-alpha/
 ```
 
 **3. Demo with Screenshots**
