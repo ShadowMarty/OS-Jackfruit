@@ -177,10 +177,15 @@ static int parse_optional_flags(control_request_t *req,
 {
     int i;
 
-    for (i = start_index; i < argc; i += 2) {
+    for (i = start_index; i < argc; i++) {
         char *end = NULL;
         long nice_value;
 
+        /* Skip arguments that don't look like flags */
+        if (argv[i][0] != '-')
+            continue;
+
+        /* Do we have a value for this flag? */
         if (i + 1 >= argc) {
             fprintf(stderr, "Missing value for option: %s\n", argv[i]);
             return -1;
@@ -189,12 +194,14 @@ static int parse_optional_flags(control_request_t *req,
         if (strcmp(argv[i], "--soft-mib") == 0) {
             if (parse_mib_flag("--soft-mib", argv[i + 1], &req->soft_limit_bytes) != 0)
                 return -1;
+            i++;  /* skip the value we just consumed */
             continue;
         }
 
         if (strcmp(argv[i], "--hard-mib") == 0) {
             if (parse_mib_flag("--hard-mib", argv[i + 1], &req->hard_limit_bytes) != 0)
                 return -1;
+            i++;
             continue;
         }
 
@@ -209,6 +216,7 @@ static int parse_optional_flags(control_request_t *req,
                 return -1;
             }
             req->nice_value = (int)nice_value;
+            i++;
             continue;
         }
 
@@ -275,14 +283,7 @@ static void bounded_buffer_destroy(bounded_buffer_t *buffer)
     pthread_mutex_destroy(&buffer->mutex);
 }
 
-static void bounded_buffer_begin_shutdown(bounded_buffer_t *buffer)
-{
-    pthread_mutex_lock(&buffer->mutex);
-    buffer->shutting_down = 1;
-    pthread_cond_broadcast(&buffer->not_empty);
-    pthread_cond_broadcast(&buffer->not_full);
-    pthread_mutex_unlock(&buffer->mutex);
-}
+/* bounded_buffer_begin_shutdown removed - functionality duplicated in supervisor cleanup */
 
 /*
  * TODO:
@@ -370,17 +371,26 @@ void *logging_thread(void *arg)
     while (1) {
         /* Pop items from buffer and write to log files */
         if (bounded_buffer_pop(&ctx->log_buffer, &item) == 0) {
-            /* Got an item, write to log file */
-            FILE *logfile = fopen(item.container_id, "a");
-            if (logfile == NULL) {
-                /* Build log path */
-                char logpath[PATH_MAX];
-                snprintf(logpath, PATH_MAX, "logs/%s.log", item.container_id);
-                logfile = fopen(logpath, "a");
-            }
+            /* Got an item, write to log file using full path */
+            char logpath[PATH_MAX];
+            FILE *logfile;
+            time_t now;
+            struct tm *timeinfo;
+            char timestamp[32];
+            
+            snprintf(logpath, PATH_MAX, "logs/%s.log", item.container_id);
+            logfile = fopen(logpath, "a");
             
             if (logfile != NULL) {
+                /* Write timestamp and container ID to show producer/consumer pipeline activity */
+                now = time(NULL);
+                timeinfo = localtime(&now);
+                strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", timeinfo);
+                fprintf(logfile, "[%s] [%s] ", timestamp, item.container_id);
+                
+                /* Write the actual container output */
                 fwrite(item.data, 1, item.length, logfile);
+                fflush(logfile);
                 fclose(logfile);
             }
         } else {
@@ -417,13 +427,7 @@ int child_fn(void *arg)
         close(cfg->stderr_fd);
     }
     
-    /* Mount proc */
-    if (mount("proc", "/proc", "proc", 0, NULL) < 0) {
-        perror("mount /proc");
-        return 1;
-    }
-    
-    /* chroot into container rootfs */
+    /* chroot into container rootfs FIRST (before any mounts) */
     if (chroot(cfg->rootfs) < 0) {
         perror("chroot");
         return 1;
@@ -432,6 +436,11 @@ int child_fn(void *arg)
     if (chdir("/") < 0) {
         perror("chdir");
         return 1;
+    }
+    
+    /* Now mount /proc inside the container at /proc */
+    if (mount("proc", "/proc", "proc", 0, NULL) < 0) {
+        perror("mount /proc");
     }
     
     /* Set nice value if requested */
@@ -443,7 +452,17 @@ int child_fn(void *arg)
     }
     
     /* Parse command and exec */
+    if (cfg->command[0] == '\0') {
+        fprintf(stderr, "Error: empty command\n");
+        return 1;
+    }
+    
     char *cmd_copy = strdup(cfg->command);
+    if (cmd_copy == NULL) {
+        perror("strdup");
+        return 1;
+    }
+    
     char *args[128] = {NULL};
     int argc = 0;
     char *token = strtok(cmd_copy, " ");
@@ -553,6 +572,30 @@ static int run_supervisor(const char *rootfs)
     if (ctx.monitor_fd < 0)
         ctx.monitor_fd = -1;
     
+    /* Prevent socket() from using FD 0-2 (standard streams) */
+    /* Open /dev/null and use it to fill FDs 0-2 */
+    int null_fd = open("/dev/null", O_RDWR);
+    if (null_fd >= 0) {
+        if (null_fd == 0) {
+            /* Got FD 0, now dup to get 1 and 2 */
+            dup2(null_fd, 1);
+            dup2(null_fd, 2);
+        } else if (null_fd == 1) {
+            /* Got FD 1, ensure 0 is filled */
+            dup2(null_fd, 0);
+            dup2(null_fd, 2);
+            close(null_fd);
+        } else if (null_fd == 2) {
+            /* Got FD 2, ensure 0 and 1 are filled */
+            dup2(null_fd, 0);
+            dup2(null_fd, 1);
+            close(null_fd);
+        } else {
+            /* Got FD 3+, stdin/stdout/stderr already set */
+            close(null_fd);
+        }
+    }
+    
     /* Create Unix domain socket for control IPC */
     unlink(CONTROL_PATH);
     ctx.server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -579,6 +622,9 @@ static int run_supervisor(const char *rootfs)
         pthread_mutex_destroy(&ctx.metadata_lock);
         return 1;
     }
+    
+    /* Create logs directory for container output */
+    mkdir("logs", 0755);
     
     /* Initialize bounded buffer */
     rc = bounded_buffer_init(&ctx.log_buffer);
@@ -629,12 +675,12 @@ static int run_supervisor(const char *rootfs)
         pthread_mutex_lock(&ctx.metadata_lock);
         container_record_t *rec = ctx.containers;
         while (rec != NULL) {
-            if (rec->state == CONTAINER_RUNNING && rec->stdout_fd >= 0) {
+            if (rec->stdout_fd >= 0) {
                 FD_SET(rec->stdout_fd, &readfds);
                 if (rec->stdout_fd > max_fd)
                     max_fd = rec->stdout_fd;
             }
-            if (rec->state == CONTAINER_RUNNING && rec->stderr_fd >= 0) {
+            if (rec->stderr_fd >= 0) {
                 FD_SET(rec->stderr_fd, &readfds);
                 if (rec->stderr_fd > max_fd)
                     max_fd = rec->stderr_fd;
@@ -660,15 +706,6 @@ static int run_supervisor(const char *rootfs)
                     /* Unregister from kernel monitor */
                     if (ctx.monitor_fd >= 0)
                         unregister_from_monitor(ctx.monitor_fd, rec->id, pid);
-                    /* Close pipes */
-                    if (rec->stdout_fd >= 0) {
-                        close(rec->stdout_fd);
-                        rec->stdout_fd = -1;
-                    }
-                    if (rec->stderr_fd >= 0) {
-                        close(rec->stderr_fd);
-                        rec->stderr_fd = -1;
-                    }
                     break;
                 }
                 rec = rec->next;
@@ -681,6 +718,11 @@ static int run_supervisor(const char *rootfs)
         if (sel < 0) {
             if (errno == EINTR)
                 continue;
+            if (errno == EBADF) {
+                /* One of the FDs became invalid (likely closed after we built the set) */
+                /* Just skip this iteration and try again */
+                continue;
+            }
             perror("select");
             break;
         }
@@ -706,6 +748,14 @@ static int run_supervisor(const char *rootfs)
                         pthread_mutex_unlock(&ctx.metadata_lock);
                         bounded_buffer_push(&ctx.log_buffer, &item);
                         pthread_mutex_lock(&ctx.metadata_lock);
+                    } else if (bytes_read == 0) {
+                        /* EOF: close the pipe */
+                        close(rec->stdout_fd);
+                        rec->stdout_fd = -1;
+                    } else {
+                        /* Error: close the pipe */
+                        close(rec->stdout_fd);
+                        rec->stdout_fd = -1;
                     }
                 }
                 
@@ -721,6 +771,14 @@ static int run_supervisor(const char *rootfs)
                         pthread_mutex_unlock(&ctx.metadata_lock);
                         bounded_buffer_push(&ctx.log_buffer, &item);
                         pthread_mutex_lock(&ctx.metadata_lock);
+                    } else if (bytes_read == 0) {
+                        /* EOF: close the pipe */
+                        close(rec->stderr_fd);
+                        rec->stderr_fd = -1;
+                    } else {
+                        /* Error: close the pipe */
+                        close(rec->stderr_fd);
+                        rec->stderr_fd = -1;
                     }
                 }
                 
@@ -730,6 +788,10 @@ static int run_supervisor(const char *rootfs)
         }
         
         if (sel == 0)
+            continue;
+
+        /* Only accept when the server socket is actually ready. */
+        if (!FD_ISSET(ctx.server_fd, &readfds))
             continue;
         
         client_fd = accept(ctx.server_fd, NULL, NULL);
@@ -800,6 +862,7 @@ static int run_supervisor(const char *rootfs)
                     rec->soft_limit_bytes = req.soft_limit_bytes;
                     rec->hard_limit_bytes = req.hard_limit_bytes;
                     rec->exit_code = -1;
+                    rec->stop_requested = 0;
                     rec->stdout_fd = pipefd_out[0];
                     rec->stderr_fd = pipefd_err[0];
                     
@@ -891,32 +954,11 @@ static int run_supervisor(const char *rootfs)
                         register_with_monitor(ctx.monitor_fd, req.container_id, pid,
                                             req.soft_limit_bytes, req.hard_limit_bytes);
                     
-                    /* Wait for container to exit */
-                    waitpid(pid, &child_status, 0);
-                    
-                    /* Update container state */
-                    pthread_mutex_lock(&ctx.metadata_lock);
-                    if (WIFEXITED(child_status)) {
-                        rec->exit_code = WEXITSTATUS(child_status);
-                        rec->exit_signal = 0;
-                    } else if (WIFSIGNALED(child_status)) {
-                        rec->exit_code = -1;
-                        rec->exit_signal = WTERMSIG(child_status);
-                    }
-                    rec->state = CONTAINER_EXITED;
-                    /* Close pipes */
-                    if (rec->stdout_fd >= 0) {
-                        close(rec->stdout_fd);
-                        rec->stdout_fd = -1;
-                    }
-                    if (rec->stderr_fd >= 0) {
-                        close(rec->stderr_fd);
-                        rec->stderr_fd = -1;
-                    }
-                    pthread_mutex_unlock(&ctx.metadata_lock);
-                    
+                    /* Send response immediately - don't block on waitpid */
+                    /* Main loop will handle reaping via SIGCHLD */
                     snprintf(resp.message, sizeof(resp.message),
-                            "Container exited with code %d", rec->exit_code);
+                            "Container %s started with PID %d", req.container_id, pid);
+                    resp.status = 0;
                 } else {
                     close(pipefd_out[0]);
                     close(pipefd_err[0]);
@@ -1057,6 +1099,82 @@ static int send_control_request(const control_request_t *req)
     int sockfd;
     control_response_t resp;
     ssize_t n;
+
+    /* ps/logs stream text first, then trailer control_response_t. */
+    if (req->kind == CMD_PS || req->kind == CMD_LOGS) {
+        char chunk[512];
+        char *all = NULL;
+        size_t total = 0;
+        size_t cap = 0;
+
+        sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (sockfd < 0) {
+            perror("socket");
+            return 1;
+        }
+
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        strncpy(addr.sun_path, CONTROL_PATH, sizeof(addr.sun_path) - 1);
+
+        if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            perror("connect to supervisor");
+            close(sockfd);
+            return 1;
+        }
+
+        if (write(sockfd, req, sizeof(*req)) != (ssize_t)sizeof(*req)) {
+            perror("write request");
+            close(sockfd);
+            return 1;
+        }
+
+        while ((n = read(sockfd, chunk, sizeof(chunk))) > 0) {
+            if (total + (size_t)n > cap) {
+                size_t new_cap = (cap == 0) ? 1024 : cap;
+                while (new_cap < total + (size_t)n)
+                    new_cap *= 2;
+                char *tmp = realloc(all, new_cap);
+                if (tmp == NULL) {
+                    perror("realloc");
+                    free(all);
+                    close(sockfd);
+                    return 1;
+                }
+                all = tmp;
+                cap = new_cap;
+            }
+            memcpy(all + total, chunk, (size_t)n);
+            total += (size_t)n;
+        }
+
+        if (n < 0) {
+            perror("read response");
+            free(all);
+            close(sockfd);
+            return 1;
+        }
+
+        if (total < sizeof(resp)) {
+            fprintf(stderr, "Invalid response from supervisor\n");
+            free(all);
+            close(sockfd);
+            return 1;
+        }
+
+        size_t payload_len = total - sizeof(resp);
+        memcpy(&resp, all + payload_len, sizeof(resp));
+
+        if (payload_len > 0)
+            fwrite(all, 1, payload_len, stdout);
+
+        if (resp.message[0] != '\0')
+            printf("%s\n", resp.message);
+
+        free(all);
+        close(sockfd);
+        return resp.status;
+    }
     
     sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (sockfd < 0) {
@@ -1087,14 +1205,6 @@ static int send_control_request(const control_request_t *req)
         return 1;
     }
     
-    if (req->kind == CMD_PS) {
-        /* Print the response data directly */
-        char buf[512];
-        while (read(sockfd, buf, sizeof(buf)) > 0) {
-            printf("%s", buf);
-        }
-    }
-    
     if (resp.message[0] != '\0')
         printf("%s\n", resp.message);
     
@@ -1105,6 +1215,9 @@ static int send_control_request(const control_request_t *req)
 static int cmd_start(int argc, char *argv[])
 {
     control_request_t req;
+    int flag_start = 5;
+    int i;
+    size_t cmd_len;
 
     if (argc < 5) {
         fprintf(stderr,
@@ -1117,11 +1230,22 @@ static int cmd_start(int argc, char *argv[])
     req.kind = CMD_START;
     strncpy(req.container_id, argv[2], sizeof(req.container_id) - 1);
     strncpy(req.rootfs, argv[3], sizeof(req.rootfs) - 1);
-    strncpy(req.command, argv[4], sizeof(req.command) - 1);
     req.soft_limit_bytes = DEFAULT_SOFT_LIMIT;
     req.hard_limit_bytes = DEFAULT_HARD_LIMIT;
 
-    if (parse_optional_flags(&req, argc, argv, 5) != 0)
+    /* Collect command and its arguments until we hit a flag (--soft-mib, etc.) */
+    for (i = 5; i < argc && argv[i][0] != '-'; i++)
+        flag_start = i + 1;
+
+    /* Build full command string from argv[4] to first flag */
+    cmd_len = 0;
+    for (i = 4; i < flag_start && i < argc; i++) {
+        if (i > 4)
+            cmd_len += snprintf(req.command + cmd_len, sizeof(req.command) - cmd_len - 1, " ");
+        cmd_len += snprintf(req.command + cmd_len, sizeof(req.command) - cmd_len - 1, "%s", argv[i]);
+    }
+
+    if (parse_optional_flags(&req, argc, argv, flag_start) != 0)
         return 1;
 
     return send_control_request(&req);
@@ -1130,6 +1254,9 @@ static int cmd_start(int argc, char *argv[])
 static int cmd_run(int argc, char *argv[])
 {
     control_request_t req;
+    int flag_start = 5;
+    int i;
+    size_t cmd_len;
 
     if (argc < 5) {
         fprintf(stderr,
@@ -1142,11 +1269,22 @@ static int cmd_run(int argc, char *argv[])
     req.kind = CMD_RUN;
     strncpy(req.container_id, argv[2], sizeof(req.container_id) - 1);
     strncpy(req.rootfs, argv[3], sizeof(req.rootfs) - 1);
-    strncpy(req.command, argv[4], sizeof(req.command) - 1);
     req.soft_limit_bytes = DEFAULT_SOFT_LIMIT;
     req.hard_limit_bytes = DEFAULT_HARD_LIMIT;
 
-    if (parse_optional_flags(&req, argc, argv, 5) != 0)
+    /* Collect command and its arguments until we hit a flag (--soft-mib, etc.) */
+    for (i = 5; i < argc && argv[i][0] != '-'; i++)
+        flag_start = i + 1;
+
+    /* Build full command string from argv[4] to first flag */
+    cmd_len = 0;
+    for (i = 4; i < flag_start && i < argc; i++) {
+        if (i > 4)
+            cmd_len += snprintf(req.command + cmd_len, sizeof(req.command) - cmd_len - 1, " ");
+        cmd_len += snprintf(req.command + cmd_len, sizeof(req.command) - cmd_len - 1, "%s", argv[i]);
+    }
+
+    if (parse_optional_flags(&req, argc, argv, flag_start) != 0)
         return 1;
 
     return send_control_request(&req);
