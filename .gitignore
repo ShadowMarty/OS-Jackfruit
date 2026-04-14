@@ -32,3 +32,6 @@ logs/
 *.swp
 *~
 .vscode/
+
+# temporary files
+temp.md
