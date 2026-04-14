@@ -548,6 +548,11 @@ static int run_supervisor(const char *rootfs)
         return 1;
     }
     
+    /* Open kernel monitor device */
+    ctx.monitor_fd = open("/dev/container_monitor", O_RDWR);
+    if (ctx.monitor_fd < 0)
+        ctx.monitor_fd = -1;
+    
     /* Create Unix domain socket for control IPC */
     unlink(CONTROL_PATH);
     ctx.server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -652,6 +657,9 @@ static int run_supervisor(const char *rootfs)
                         rec->exit_code = -1;
                         rec->exit_signal = WTERMSIG(status);
                     }
+                    /* Unregister from kernel monitor */
+                    if (ctx.monitor_fd >= 0)
+                        unregister_from_monitor(ctx.monitor_fd, rec->id, pid);
                     /* Close pipes */
                     if (rec->stdout_fd >= 0) {
                         close(rec->stdout_fd);
@@ -802,6 +810,11 @@ static int run_supervisor(const char *rootfs)
                     ctx.containers = rec;
                     pthread_mutex_unlock(&ctx.metadata_lock);
                     
+                    /* Register with kernel monitor */
+                    if (ctx.monitor_fd >= 0)
+                        register_with_monitor(ctx.monitor_fd, req.container_id, pid,
+                                            req.soft_limit_bytes, req.hard_limit_bytes);
+                    
                     snprintf(resp.message, sizeof(resp.message),
                             "Container %s started with PID %d", req.container_id, pid);
                 } else {
@@ -872,6 +885,11 @@ static int run_supervisor(const char *rootfs)
                     rec->next = ctx.containers;
                     ctx.containers = rec;
                     pthread_mutex_unlock(&ctx.metadata_lock);
+                    
+                    /* Register with kernel monitor */
+                    if (ctx.monitor_fd >= 0)
+                        register_with_monitor(ctx.monitor_fd, req.container_id, pid,
+                                            req.soft_limit_bytes, req.hard_limit_bytes);
                     
                     /* Wait for container to exit */
                     waitpid(pid, &child_status, 0);
@@ -981,6 +999,9 @@ static int run_supervisor(const char *rootfs)
     /* Cleanup */
     close(ctx.server_fd);
     unlink(CONTROL_PATH);
+    
+    if (ctx.monitor_fd >= 0)
+        close(ctx.monitor_fd);
     
     /* Close all remaining pipe file descriptors */
     pthread_mutex_lock(&ctx.metadata_lock);
