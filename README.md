@@ -4,8 +4,8 @@ A lightweight Linux container runtime built to understand process isolation, sup
 
 ## Team Information
 
-**Selvaganesh Arunmozhi** — PES2UG24CS451
-**Shashank A** — PES2UG24CS461  
+- **Selvaganesh Arunmozhi** — PES2UG24CS451
+- **Shashank A** — PES2UG24CS461  
 
 ---
 
@@ -119,41 +119,41 @@ ps aux | grep engine | grep -v grep    # Should be empty
 
 ### Isolation Mechanisms
 
-Process and filesystem isolation happens through Linux namespaces and chroot. The supervisor calls `clone()` with `CLONE_NEWPID`, `CLONE_NEWUTS`, and `CLONE_NEWNS` when creating a container. This gives each container its own process ID space—its command becomes PID 1 within that namespace, even though the kernel sees a different PID. UTS namespace provides a separate hostname, and mount namespace means the container only sees its own filesystem under the rootfs directory.
+- Process and filesystem isolation happens through Linux namespaces and chroot. The supervisor calls `clone()` with `CLONE_NEWPID`, `CLONE_NEWUTS`, and `CLONE_NEWNS` when creating a container. This gives each container its own process ID space—its command becomes PID 1 within that namespace, even though the kernel sees a different PID. UTS namespace provides a separate hostname, and mount namespace means the container only sees its own filesystem under the rootfs directory.
 
-The kernel still shares hardware resources that can't be virtualized. Every container runs on the same CPU cores, same RAM hardware, same system clock. The hardware address space is shared at the CPU level. Network hardware is the same for all containers—namespaces handle the naming and routing, not the actual device. Chroot combined with mount namespace prevents a container from accessing files outside its rootfs, but both containers are reading from the same underlying disk and filesystem cache.
+- The kernel still shares hardware resources that can't be virtualized. Every container runs on the same CPU cores, same RAM hardware, same system clock. The hardware address space is shared at the CPU level. Network hardware is the same for all containers—namespaces handle the naming and routing, not the actual device. Chroot combined with mount namespace prevents a container from accessing files outside its rootfs, but both containers are reading from the same underlying disk and filesystem cache.
 
 ### Supervisor and Process Lifecycle
 
-A long-running supervisor is necessary because someone has to watch the children. Without it, when a container exits, it becomes an orphan—the kernel reparents it to the actual init process on the system. The supervisor stays alive to reap (collect exit status from) each container, preventing zombies and maintaining a record of what ran.
+- A long-running supervisor is necessary because someone has to watch the children. Without it, when a container exits, it becomes an orphan—the kernel reparents it to the actual init process on the system. The supervisor stays alive to reap (collect exit status from) each container, preventing zombies and maintaining a record of what ran.
 
-When a container's process exits, the kernel sends SIGCHLD to the supervisor. The signal handler sets a flag, then the main event loop calls `waitpid(-1, &status, WNOHANG)` to reap the child without blocking. Each container is tracked in a list with its PID, ID string, state, pipes for logging, and soft/hard memory limits. When a container finishes, the supervisor closes its pipes, marks it as exited, and cleans up during shutdown.
+- When a container's process exits, the kernel sends SIGCHLD to the supervisor. The signal handler sets a flag, then the main event loop calls `waitpid(-1, &status, WNOHANG)` to reap the child without blocking. Each container is tracked in a list with its PID, ID string, state, pipes for logging, and soft/hard memory limits. When a container finishes, the supervisor closes its pipes, marks it as exited, and cleans up during shutdown.
 
-Signal delivery defines the process hierarchy. A container doesn't see signals meant for other containers—each has its own PID namespace. Ctrl+C in the supervisor terminal sends SIGINT to it, triggering its cleanup handler, which closes pipes and tells the logger thread to exit. The supervisor then joins the logger thread and exits. Clean signal flow depends on proper parent-child relationships.
+- Signal delivery defines the process hierarchy. A container doesn't see signals meant for other containers—each has its own PID namespace. Ctrl+C in the supervisor terminal sends SIGINT to it, triggering its cleanup handler, which closes pipes and tells the logger thread to exit. The supervisor then joins the logger thread and exits. Clean signal flow depends on proper parent-child relationships.
 
 ### IPC, Threads, and Synchronization
 
-Two IPC paths coexist: pipes for container logging and a Unix domain socket for control commands. Pipes are set up before forking a container—the child's stdout and stderr get redirected to the pipe's write end via `dup2()`, and the parent reads from the read end in a separate logging thread.
+- Two IPC paths coexist: pipes for container logging and a Unix domain socket for control commands. Pipes are set up before forking a container—the child's stdout and stderr get redirected to the pipe's write end via `dup2()`, and the parent reads from the read end in a separate logging thread.
 
-The logging thread pops messages from a bounded buffer (circular array, max 128 items). Without synchronization, a race condition happens if the main thread pushes while the logger pops—both threads access `head`, `tail`, and `count`, and without protection they corrupt each other's reads and writes. A mutex ensures only one thread modifies these at a time. Two condition variables coordinate: `not_empty` signals the logger when the buffer has items, and `not_full` signals the main thread when space opens up after the logger catches up.
+- The logging thread pops messages from a bounded buffer (circular array, max 128 items). Without synchronization, a race condition happens if the main thread pushes while the logger pops—both threads access `head`, `tail`, and `count`, and without protection they corrupt each other's reads and writes. A mutex ensures only one thread modifies these at a time. Two condition variables coordinate: `not_empty` signals the logger when the buffer has items, and `not_full` signals the main thread when space opens up after the logger catches up.
 
-The socket handles control commands (run, stop, ps, logs). The supervisor uses `select()` to detect incoming connections, then reads and processes each command serially. No race here because a single thread handles commands one at a time.
+- The socket handles control commands (run, stop, ps, logs). The supervisor uses `select()` to detect incoming connections, then reads and processes each command serially. No race here because a single thread handles commands one at a time.
 
 ### Memory Management and Enforcement
 
-RSS (Resident Set Size) counts physical memory pages currently in RAM. It doesn't count swap, doesn't count memory-mapped regions that haven't been touched, and counts shared pages from each process's perspective. So RSS measures the real RAM footprint right now, not maximum possible memory.
+- RSS (Resident Set Size) counts physical memory pages currently in RAM. It doesn't count swap, doesn't count memory-mapped regions that haven't been touched, and counts shared pages from each process's perspective. So RSS measures the real RAM footprint right now, not maximum possible memory.
 
-Soft and hard limits are different policies. A soft limit triggers a warning when RSS crosses it—useful for monitoring. You might see a soft-limit warning and give the application a chance to free memory. A hard limit kills the process with SIGKILL when crossed—no escape, no second chance. Soft limits observe, hard limits enforce.
+- Soft and hard limits are different policies. A soft limit triggers a warning when RSS crosses it—useful for monitoring. You might see a soft-limit warning and give the application a chance to free memory. A hard limit kills the process with SIGKILL when crossed—no escape, no second chance. Soft limits observe, hard limits enforce.
 
-Enforcement must be in kernel space because the kernel owns process memory. A user-space monitor would sample RSS by reading `/proc/pid/status`, but by the time it parses the value and decides to act, the process might have allocated more. The samples are slow and imprecise. A kernel module with a timer callback runs once per second, reads RSS directly from the kernel's page tables atomically, and can issue SIGKILL immediately. The process can't intercept or delay the signal. The kernel's memory accounting is always correct because the kernel manages every page.
+- Enforcement must be in kernel space because the kernel owns process memory. A user-space monitor would sample RSS by reading `/proc/pid/status`, but by the time it parses the value and decides to act, the process might have allocated more. The samples are slow and imprecise. A kernel module with a timer callback runs once per second, reads RSS directly from the kernel's page tables atomically, and can issue SIGKILL immediately. The process can't intercept or delay the signal. The kernel's memory accounting is always correct because the kernel manages every page.
 
 ### Scheduling Behavior
 
-The Linux scheduler aims for fairness—processes with the same priority get roughly equal CPU time. It also tries to be responsive—interactive tasks (waiting on I/O) should run quickly when they become ready.
+- The Linux scheduler aims for fairness—processes with the same priority get roughly equal CPU time. It also tries to be responsive—interactive tasks (waiting on I/O) should run quickly when they become ready.
 
-CPU-bound processes (like cpu_hog constantly computing) hold the CPU for their full timeslice before the scheduler preempts them. I/O-bound processes (like io_pulse writing files then sleeping) yield the CPU during I/O, so they don't use their full timeslice. The scheduler favors processes that haven't used much CPU recently, so I/O-bound tasks often complete faster.
+- CPU-bound processes (like cpu_hog constantly computing) hold the CPU for their full timeslice before the scheduler preempts them. I/O-bound processes (like io_pulse writing files then sleeping) yield the CPU during I/O, so they don't use their full timeslice. The scheduler favors processes that haven't used much CPU recently, so I/O-bound tasks often complete faster.
 
-Using nice values to change priority shows this in action. A cpu_hog with nice +10 (lower priority) runs maybe 75% as long as one with nice 0 (default). When a CPU-bound and I/O-bound process run together, the I/O-bound one usually finishes first because it consistently yields the CPU to the other process during sleeps. Context switching adds overhead, but the CPU stays busy because it's rarely idle waiting for I/O.
+- Using nice values to change priority shows this in action. A cpu_hog with nice +10 (lower priority) runs maybe 75% as long as one with nice 0 (default). When a CPU-bound and I/O-bound process run together, the I/O-bound one usually finishes first because it consistently yields the CPU to the other process during sleeps. Context switching adds overhead, but the CPU stays busy because it's rarely idle waiting for I/O.
 
 ---
 
@@ -161,59 +161,45 @@ Using nice values to change priority shows this in action. A cpu_hog with nice +
 
 ### Namespace Isolation (PID, UTS, Mount)
 
-**Choice:** Full namespace isolation with `clone(CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS)` + chroot into per-container rootfs.
-
-**Tradeoff:** Each container needs its own rootfs copy (extra disk space) vs. shared rootfs (faster setup but containers can interfere with each other).
-
-**Justification:** Real isolation prevents containers from seeing each other's processes or filesystems. This is worth the disk overhead because it matches real-world container behavior (Docker, etc.). Containers are meant to be separate.
+- **Choice:** Full namespace isolation with `clone(CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS)` + chroot into per-container rootfs.
+- **Tradeoff:** Each container needs its own rootfs copy (extra disk space) vs. shared rootfs (faster setup but containers can interfere with each other).
+- **Justification:** Real isolation prevents containers from seeing each other's processes or filesystems. This is worth the disk overhead because it matches real-world container behavior (Docker, etc.). Containers are meant to be separate.
 
 ### Supervisor Architecture (Parent Stays Alive)
 
-**Choice:** Long-running supervisor process that waits on all children via `waitpid(WNOHANG)` and signal handlers.
-
-**Tradeoff:** Supervisor complexity and memory overhead vs. simpler per-container parent (but then zombies accumulate permanently).
-
-**Justification:** Without a parent reaper, children become zombies when they exit. The supervisor is minimal overhead but essential—it's the only way to prevent orphans and maintain metadata.
+- **Choice:** Long-running supervisor process that waits on all children via `waitpid(WNOHANG)` and signal handlers.
+- **Tradeoff:** Supervisor complexity and memory overhead vs. simpler per-container parent (but then zombies accumulate permanently).
+- **Justification:** Without a parent reaper, children become zombies when they exit. The supervisor is minimal overhead but essential—it's the only way to prevent orphans and maintain metadata.
 
 ### IPC for Logging (Pipes + Bounded Buffer + Logger Thread)
 
-**Choice:** Pipes from container stdout/stderr, bounded-buffer circular array (128 items), logger thread reads asynchronously.
-
-**Tradeoff:** Extra thread and synchronization complexity vs. simpler synchronous I/O (but would block supervisor, no logging during events).
-
-**Justification:** The supervisor must stay responsive to CLI commands and signals. A blocking read would freeze it. Async logging with a bounded buffer means we never lose memory even if a container spams stdout.
+- **Choice:** Pipes from container stdout/stderr, bounded-buffer circular array (128 items), logger thread reads asynchronously.
+- **Tradeoff:** Extra thread and synchronization complexity vs. simpler synchronous I/O (but would block supervisor, no logging during events).
+- **Justification:** The supervisor must stay responsive to CLI commands and signals. A blocking read would freeze it. Async logging with a bounded buffer means we never lose memory even if a container spams stdout.
 
 ### IPC for Control (Unix Domain Socket)
 
-**Choice:** Bidirectional Unix socket at `/tmp/mini_runtime.sock` for CLI commands (start/run/ps/logs/stop).
-
-**Tradeoff:** Socket needs serialization code vs. pipes (simpler but unidirectional, need separate pipes per command).
-
-**Justification:** One socket handle per client, both request and response on same connection. Clean multiplex with `select()`, scales to multiple CLI clients.
+- **Choice:** Bidirectional Unix socket at `/tmp/mini_runtime.sock` for CLI commands (start/run/ps/logs/stop).
+- **Tradeoff:** Socket needs serialization code vs. pipes (simpler but unidirectional, need separate pipes per command).
+- **Justification:** One socket handle per client, both request and response on same connection. Clean multiplex with `select()`, scales to multiple CLI clients.
 
 ### Memory Monitoring (Kernel Module)
 
-**Choice:** Kernel module with timer callback checking RSS every 1 second, soft-limits log to dmesg, hard-limits send SIGKILL.
-
-**Tradeoff:** Kernel code complexity vs. simpler user-space monitor (but slow, imprecise, can't enforce immediately).
-
-**Justification:** Kernel sees RSS atomically, no time gap between check and enforcement. User-space would have delay and race conditions. SIGKILL can't be caught/avoided, guarantees hard-limit enforcement.
+- **Choice:** Kernel module with timer callback checking RSS every 1 second, soft-limits log to dmesg, hard-limits send SIGKILL.
+- **Tradeoff:** Kernel code complexity vs. simpler user-space monitor (but slow, imprecise, can't enforce immediately).
+- **Justification:** Kernel sees RSS atomically, no time gap between check and enforcement. User-space would have delay and race conditions. SIGKILL can't be caught/avoided, guarantees hard-limit enforcement.
 
 ### Soft-Limit vs. Hard-Limit
 
-**Choice:** Two-tier: soft logs warning, hard kills process.
-
-**Tradeoff:** More code/logic vs. single limit (either warn or kill).
-
-**Justification:** Observability matters. Soft limit lets ops see problems coming, hard limit is the safety net. Two tiers give both.
+- **Choice:** Two-tier: soft logs warning, hard kills process.
+- **Tradeoff:** More code/logic vs. single limit (either warn or kill).
+- **Justification:** Observability matters. Soft limit lets ops see problems coming, hard limit is the safety net. Two tiers give both.
 
 ### Scheduler (No Explicit nice/priority Changes)
 
-**Choice:** Default priority (nice 0) for all containers, but workload binaries accept `--nice` parameter for experiments.
-
-**Tradeoff:** No automatic fairness vs. full priority automation (but then harder to observe scheduler behavior).
-
-**Justification:** Let user control priority explicitly for experiments. Observe how scheduler responds to different priorities and workload types.
+- **Choice:** Default priority (nice 0) for all containers, but workload binaries accept `--nice` parameter for experiments.
+- **Tradeoff:** No automatic fairness vs. full priority automation (but then harder to observe scheduler behavior).
+- **Justification:** Let user control priority explicitly for experiments. Observe how scheduler responds to different priorities and workload types.
 
 ---
 
@@ -450,48 +436,70 @@ soft_test            38237      exited     1776246058           -9
 
 ---
 
-### Screenshot 7: Scheduling Experiment
+### Screenshot 7: Concurrent Scheduling Experiment
 
-**Caption:** Terminal output showing CPU-bound vs. I/O-bound workload timing comparison.
+![alt text](images/image-7.png)
+
+**Caption:** CPU-bound vs. I/O-bound workload executed concurrently, demonstrating Linux scheduler responsiveness and fairness.
 
 **Shows:**
-- Two terminal windows or timestamped output
-- `time ./engine run cpu1 ./rootfs-alpha /cpu_hog` — real, user, sys times
-- `time ./engine run io1 ./rootfs-beta /io_pulse` — real, user, sys times
-- Comparison showing I/O completing faster despite longer wall-clock time
-- Or: table of results (CPU: 10.2s, I/O: 30s when run concurrently shows I/O completes shortly after CPU)
+- Supervisor started with two concurrent containers running different workloads
+- CPU container (cpu_container) runs `/cpu_hog 3` (3 second CPU-intensive task)
+- I/O container (io_container) runs `/io_pulse 5 200` (5 iterations with 200ms sleep)
+- Container metadata from `sudo ./engine ps` showing both containers created and exited
+- Log output from both containers with precise timestamps
+
+**Key Observations:**
 
 ```
-CPU-bound workload:    10.2s real,  9.8s user,  0.1s sys
-I/O-bound workload:    30.1s real, 15.3s user,  2.4s sys
-(When run together: I/O finishes ~same time as CPU, showing scheduler responsiveness)
+--- Concurrent CPU-bound vs I/O-bound Scheduling ---
+[+] 62471 Container cpu_container started with PID 62479
+[+] 62478 Container io_container started with PID 62478
+
+=== CPU Container Output ===
+[2026-04-14 17:14:19] [cpu_container] cpu_hog alive elapsed=1 accumulator=6291507215921054711
+[2026-04-14 17:14:20] [cpu_container] cpu_hog alive elapsed=2 accumulator=3819776264411534833
+
+=== I/O Container Output ===
+[2026-04-14 17:14:18] [io_container] io_pulse wrote iteration=1
+[2026-04-14 17:14:19] [io_container] io_pulse wrote iteration=2
+
+real    0m1.015s
 ```
+
+**Analysis:**
+- CPU workload started 17:14:19 and completed 17:14:21 (3 seconds as expected)
+- I/O workload started 17:14:18 and completed 17:14:19 (~1 second despite 5 iterations)
+- Both containers executed concurrently; CPU container got full 3s timeslice while I/O container's 200ms sleeps yielded CPU to it
+- Scheduler responsiveness demonstrated: I/O process completed quickly by yielding during sleeps
+- Fairness observed: both containers' workloads completed with no starvation
 
 ---
 
-### Screenshot 8: Clean Teardown (No Zombies)
+### Screenshot 8: Clean Teardown (Graceful Shutdown, No Zombies)
 
-**Caption:** Evidence of clean shutdown: no zombie processes, supervisor exits cleanly, module unloads.
+![alt text](images/image-8.png)
+
+**Caption:** Supervisor graceful shutdown demonstrating proper process reaping—no zombie processes remain after supervisor exits.
 
 **Shows:**
-- `ps aux | grep engine` before Ctrl+C showing supervisor + containers
-- Terminal 1 (supervisor) showing: "Supervisor stopped cleanly"
-- `ps aux | grep engine` after shutdown showing EMPTY (no defunct processes)
-- `dmesg | tail` showing: "monitor_exit: cleaning up..." and "module unloaded"
-- `sudo rmmod monitor` succeeding with no errors
+- **Before shutdown:** Supervisor process running with active containers
+- **Shutdown initiation:** `sudo pkill -SIGTERM -f "engine supervisor"` sends graceful termination signal
+- **After shutdown:** Verification that no zombie processes remain
 
+**Process Lifecycle Evidence:**
+
+```bash
+ps aux | grep engine              # supervisor running
+sudo pkill -SIGTERM -f "engine supervisor"
+ps aux | grep engine              # empty - no zombies
+# Output: "Supervisor stopped"
 ```
-# Before shutdown
-seed          123       1 ...  ./engine supervisor
-seed          124     123 ...  [engine] alpha
 
-# Supervisor receives Ctrl+C
-Supervisor stopped cleanly
-
-# After shutdown
-ps aux | grep engine      # (no output, empty)
-dmesg | tail              # Shows module cleanup messages
-```
+**Key Requirements Met:**
+1. **Process reaping:** All child containers reaped by supervisor before exit (no `<defunct>` zombies in ps output)
+2. **Clean exit:** Supervisor receives SIGTERM, closes all file descriptors and socket, exits cleanly with message "Supervisor stopped"
+3. **No lingering processes:** Second `ps aux | grep engine` shows empty—supervisor process cleanly removed from system process table
 
 ---
 

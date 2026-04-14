@@ -1287,7 +1287,79 @@ static int cmd_run(int argc, char *argv[])
     if (parse_optional_flags(&req, argc, argv, flag_start) != 0)
         return 1;
 
-    return send_control_request(&req);
+    /* Send the run request */
+    if (send_control_request(&req) != 0)
+        return 1;
+
+    /* Wait for the container to complete by polling ps */
+    control_request_t ps_req;
+    memset(&ps_req, 0, sizeof(ps_req));
+    ps_req.kind = CMD_PS;
+
+    int max_attempts = 3600;  /* Max 1 hour wait */
+    int attempts = 0;
+    
+    while (attempts < max_attempts) {
+        sleep(1);  /* Poll every 1 second */
+        attempts++;
+        
+        struct sockaddr_un addr;
+        int sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (sockfd < 0) {
+            perror("socket");
+            return 1;
+        }
+        
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        strncpy(addr.sun_path, CONTROL_PATH, sizeof(addr.sun_path) - 1);
+        
+        if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            close(sockfd);
+            continue;  /* Retry */
+        }
+        
+        if (write(sockfd, &ps_req, sizeof(ps_req)) != (ssize_t)sizeof(ps_req)) {
+            close(sockfd);
+            continue;
+        }
+        
+        /* Read ps output and look for our container */
+        char buffer[8192];
+        ssize_t total_read = 0;
+        ssize_t n;
+        
+        while ((n = read(sockfd, buffer + total_read, sizeof(buffer) - total_read - 1)) > 0) {
+            total_read += n;
+        }
+        
+        buffer[total_read] = '\0';
+        close(sockfd);
+        
+        /* Look for container ID and check if it's exited */
+        if (strstr(buffer, argv[2])) {
+            /* Find the line with our container */
+            char *line_start = buffer;
+            char *line_end;
+            int found_exited = 0;
+            
+            while ((line_end = strchr(line_start, '\n')) != NULL) {
+                *line_end = '\0';
+                if (strstr(line_start, argv[2])) {
+                    /* Check this line */
+                    if (strstr(line_start, "exited")) {
+                        found_exited = 1;
+                    }
+                }
+                line_start = line_end + 1;
+            }
+            
+            if (found_exited)
+                break;  /* Container has completed */
+        }
+    }
+
+    return 0;
 }
 
 static int cmd_ps(void)
