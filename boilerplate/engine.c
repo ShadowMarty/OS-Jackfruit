@@ -120,6 +120,8 @@ typedef struct {
     char command[CHILD_COMMAND_LEN];
     int nice_value;
     int log_write_fd;
+    int stdout_fd;
+    int stderr_fd;
 } child_config_t;
 
 typedef struct {
@@ -362,7 +364,31 @@ int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
  */
 void *logging_thread(void *arg)
 {
-    (void)arg;
+    supervisor_ctx_t *ctx = (supervisor_ctx_t *)arg;
+    log_item_t item;
+    
+    while (1) {
+        /* Pop items from buffer and write to log files */
+        if (bounded_buffer_pop(&ctx->log_buffer, &item) == 0) {
+            /* Got an item, write to log file */
+            FILE *logfile = fopen(item.container_id, "a");
+            if (logfile == NULL) {
+                /* Build log path */
+                char logpath[PATH_MAX];
+                snprintf(logpath, PATH_MAX, "logs/%s.log", item.container_id);
+                logfile = fopen(logpath, "a");
+            }
+            
+            if (logfile != NULL) {
+                fwrite(item.data, 1, item.length, logfile);
+                fclose(logfile);
+            }
+        } else {
+            /* Buffer is empty and shutting down */
+            break;
+        }
+    }
+    
     return NULL;
 }
 
@@ -380,6 +406,16 @@ void *logging_thread(void *arg)
 int child_fn(void *arg)
 {
     child_config_t *cfg = (child_config_t *)arg;
+    
+    /* Redirect stdout and stderr to pipes */
+    if (cfg->stdout_fd >= 0) {
+        dup2(cfg->stdout_fd, STDOUT_FILENO);
+        close(cfg->stdout_fd);
+    }
+    if (cfg->stderr_fd >= 0) {
+        dup2(cfg->stderr_fd, STDERR_FILENO);
+        close(cfg->stderr_fd);
+    }
     
     /* Mount proc */
     if (mount("proc", "/proc", "proc", 0, NULL) < 0) {
@@ -539,6 +575,27 @@ static int run_supervisor(const char *rootfs)
         return 1;
     }
     
+    /* Initialize bounded buffer */
+    rc = bounded_buffer_init(&ctx.log_buffer);
+    if (rc != 0) {
+        errno = rc;
+        perror("bounded_buffer_init");
+        close(ctx.server_fd);
+        pthread_mutex_destroy(&ctx.metadata_lock);
+        return 1;
+    }
+    
+    /* Start logging thread */
+    rc = pthread_create(&ctx.logger_thread, NULL, logging_thread, &ctx);
+    if (rc != 0) {
+        errno = rc;
+        perror("pthread_create logger");
+        bounded_buffer_destroy(&ctx.log_buffer);
+        close(ctx.server_fd);
+        pthread_mutex_destroy(&ctx.metadata_lock);
+        return 1;
+    }
+    
     /* Set up signal handlers */
     signal(SIGCHLD, sigchld_handler);
     signal(SIGINT, sigint_handler);
@@ -554,12 +611,32 @@ static int run_supervisor(const char *rootfs)
         control_response_t resp;
         int client_fd;
         ssize_t n;
+        int max_fd;
         
         /* Set up for select with timeout to handle SIGCHLD */
         FD_ZERO(&readfds);
         FD_SET(ctx.server_fd, &readfds);
+        max_fd = ctx.server_fd;
         tv.tv_sec = 1;
         tv.tv_usec = 0;
+        
+        /* Add container pipes to select */
+        pthread_mutex_lock(&ctx.metadata_lock);
+        container_record_t *rec = ctx.containers;
+        while (rec != NULL) {
+            if (rec->state == CONTAINER_RUNNING && rec->stdout_fd >= 0) {
+                FD_SET(rec->stdout_fd, &readfds);
+                if (rec->stdout_fd > max_fd)
+                    max_fd = rec->stdout_fd;
+            }
+            if (rec->state == CONTAINER_RUNNING && rec->stderr_fd >= 0) {
+                FD_SET(rec->stderr_fd, &readfds);
+                if (rec->stderr_fd > max_fd)
+                    max_fd = rec->stderr_fd;
+            }
+            rec = rec->next;
+        }
+        pthread_mutex_unlock(&ctx.metadata_lock);
         
         /* Reap any exited children */
         while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
@@ -575,6 +652,15 @@ static int run_supervisor(const char *rootfs)
                         rec->exit_code = -1;
                         rec->exit_signal = WTERMSIG(status);
                     }
+                    /* Close pipes */
+                    if (rec->stdout_fd >= 0) {
+                        close(rec->stdout_fd);
+                        rec->stdout_fd = -1;
+                    }
+                    if (rec->stderr_fd >= 0) {
+                        close(rec->stderr_fd);
+                        rec->stderr_fd = -1;
+                    }
                     break;
                 }
                 rec = rec->next;
@@ -583,12 +669,56 @@ static int run_supervisor(const char *rootfs)
         }
         
         /* Accept new connections with timeout */
-        int sel = select(ctx.server_fd + 1, &readfds, NULL, NULL, &tv);
+        int sel = select(max_fd + 1, &readfds, NULL, NULL, &tv);
         if (sel < 0) {
             if (errno == EINTR)
                 continue;
             perror("select");
             break;
+        }
+        
+        /* Producer side: read from container pipes (if any) */
+        if (sel > 0) {
+            pthread_mutex_lock(&ctx.metadata_lock);
+            rec = ctx.containers;
+            while (rec != NULL) {
+                container_record_t *next = rec->next;
+                char buf[LOG_CHUNK_SIZE];
+                ssize_t bytes_read;
+                
+                /* Read from stdout */
+                if (rec->stdout_fd >= 0 && FD_ISSET(rec->stdout_fd, &readfds)) {
+                    bytes_read = read(rec->stdout_fd, buf, LOG_CHUNK_SIZE);
+                    if (bytes_read > 0) {
+                        log_item_t item;
+                        memset(&item, 0, sizeof(item));
+                        strncpy(item.container_id, rec->id, sizeof(item.container_id) - 1);
+                        item.length = bytes_read;
+                        memcpy(item.data, buf, bytes_read);
+                        pthread_mutex_unlock(&ctx.metadata_lock);
+                        bounded_buffer_push(&ctx.log_buffer, &item);
+                        pthread_mutex_lock(&ctx.metadata_lock);
+                    }
+                }
+                
+                /* Read from stderr */
+                if (rec->stderr_fd >= 0 && FD_ISSET(rec->stderr_fd, &readfds)) {
+                    bytes_read = read(rec->stderr_fd, buf, LOG_CHUNK_SIZE);
+                    if (bytes_read > 0) {
+                        log_item_t item;
+                        memset(&item, 0, sizeof(item));
+                        strncpy(item.container_id, rec->id, sizeof(item.container_id) - 1);
+                        item.length = bytes_read;
+                        memcpy(item.data, buf, bytes_read);
+                        pthread_mutex_unlock(&ctx.metadata_lock);
+                        bounded_buffer_push(&ctx.log_buffer, &item);
+                        pthread_mutex_lock(&ctx.metadata_lock);
+                    }
+                }
+                
+                rec = next;
+            }
+            pthread_mutex_unlock(&ctx.metadata_lock);
         }
         
         if (sel == 0)
@@ -614,6 +744,17 @@ static int run_supervisor(const char *rootfs)
             /* Create container */
             char stack[STACK_SIZE];
             child_config_t child_cfg;
+            int pipefd_out[2], pipefd_err[2];
+            
+            /* Create pipes for stdout/stderr */
+            if (pipe(pipefd_out) < 0 || pipe(pipefd_err) < 0) {
+                perror("pipe");
+                resp.status = 1;
+                snprintf(resp.message, sizeof(resp.message), "pipe creation failed");
+                write(client_fd, &resp, sizeof(resp));
+                close(client_fd);
+                continue;
+            }
             
             memset(&child_cfg, 0, sizeof(child_cfg));
             strncpy(child_cfg.id, req.container_id, sizeof(child_cfg.id) - 1);
@@ -621,14 +762,22 @@ static int run_supervisor(const char *rootfs)
             strncpy(child_cfg.command, req.command, sizeof(child_cfg.command) - 1);
             child_cfg.nice_value = req.nice_value;
             child_cfg.log_write_fd = -1;
+            child_cfg.stdout_fd = pipefd_out[1];
+            child_cfg.stderr_fd = pipefd_err[1];
             
             /* Clone with namespaces */
             pid = clone(child_fn, stack + STACK_SIZE,
                        CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD,
                        &child_cfg);
             
+            /* Close write ends in parent */
+            close(pipefd_out[1]);
+            close(pipefd_err[1]);
+            
             if (pid < 0) {
                 perror("clone");
+                close(pipefd_out[0]);
+                close(pipefd_err[0]);
                 resp.status = 1;
                 snprintf(resp.message, sizeof(resp.message), "clone failed");
             } else {
@@ -643,6 +792,8 @@ static int run_supervisor(const char *rootfs)
                     rec->soft_limit_bytes = req.soft_limit_bytes;
                     rec->hard_limit_bytes = req.hard_limit_bytes;
                     rec->exit_code = -1;
+                    rec->stdout_fd = pipefd_out[0];
+                    rec->stderr_fd = pipefd_err[0];
                     
                     snprintf(rec->log_path, PATH_MAX, "logs/%s.log", req.container_id);
                     
@@ -654,6 +805,8 @@ static int run_supervisor(const char *rootfs)
                     snprintf(resp.message, sizeof(resp.message),
                             "Container %s started with PID %d", req.container_id, pid);
                 } else {
+                    close(pipefd_out[0]);
+                    close(pipefd_err[0]);
                     resp.status = 1;
                     snprintf(resp.message, sizeof(resp.message), "malloc failed");
                 }
@@ -663,6 +816,17 @@ static int run_supervisor(const char *rootfs)
             char stack[STACK_SIZE];
             child_config_t child_cfg;
             int child_status;
+            int pipefd_out[2], pipefd_err[2];
+            
+            /* Create pipes for stdout/stderr */
+            if (pipe(pipefd_out) < 0 || pipe(pipefd_err) < 0) {
+                perror("pipe");
+                resp.status = 1;
+                snprintf(resp.message, sizeof(resp.message), "pipe creation failed");
+                write(client_fd, &resp, sizeof(resp));
+                close(client_fd);
+                continue;
+            }
             
             memset(&child_cfg, 0, sizeof(child_cfg));
             strncpy(child_cfg.id, req.container_id, sizeof(child_cfg.id) - 1);
@@ -670,13 +834,21 @@ static int run_supervisor(const char *rootfs)
             strncpy(child_cfg.command, req.command, sizeof(child_cfg.command) - 1);
             child_cfg.nice_value = req.nice_value;
             child_cfg.log_write_fd = -1;
+            child_cfg.stdout_fd = pipefd_out[1];
+            child_cfg.stderr_fd = pipefd_err[1];
             
             pid = clone(child_fn, stack + STACK_SIZE,
                        CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD,
                        &child_cfg);
             
+            /* Close write ends in parent */
+            close(pipefd_out[1]);
+            close(pipefd_err[1]);
+            
             if (pid < 0) {
                 perror("clone");
+                close(pipefd_out[0]);
+                close(pipefd_err[0]);
                 resp.status = 1;
                 snprintf(resp.message, sizeof(resp.message), "clone failed");
             } else {
@@ -692,6 +864,8 @@ static int run_supervisor(const char *rootfs)
                     rec->hard_limit_bytes = req.hard_limit_bytes;
                     rec->exit_code = -1;
                     rec->stop_requested = 0;
+                    rec->stdout_fd = pipefd_out[0];
+                    rec->stderr_fd = pipefd_err[0];
                     snprintf(rec->log_path, PATH_MAX, "logs/%s.log", req.container_id);
                     
                     pthread_mutex_lock(&ctx.metadata_lock);
@@ -712,11 +886,22 @@ static int run_supervisor(const char *rootfs)
                         rec->exit_signal = WTERMSIG(child_status);
                     }
                     rec->state = CONTAINER_EXITED;
+                    /* Close pipes */
+                    if (rec->stdout_fd >= 0) {
+                        close(rec->stdout_fd);
+                        rec->stdout_fd = -1;
+                    }
+                    if (rec->stderr_fd >= 0) {
+                        close(rec->stderr_fd);
+                        rec->stderr_fd = -1;
+                    }
                     pthread_mutex_unlock(&ctx.metadata_lock);
                     
                     snprintf(resp.message, sizeof(resp.message),
                             "Container exited with code %d", rec->exit_code);
                 } else {
+                    close(pipefd_out[0]);
+                    close(pipefd_err[0]);
                     resp.status = 1;
                     snprintf(resp.message, sizeof(resp.message), "malloc failed");
                 }
@@ -797,8 +982,33 @@ static int run_supervisor(const char *rootfs)
     close(ctx.server_fd);
     unlink(CONTROL_PATH);
     
+    /* Close all remaining pipe file descriptors */
     pthread_mutex_lock(&ctx.metadata_lock);
     container_record_t *rec = ctx.containers;
+    while (rec != NULL) {
+        if (rec->stdout_fd >= 0) close(rec->stdout_fd);
+        if (rec->stderr_fd >= 0) close(rec->stderr_fd);
+        rec = rec->next;
+    }
+    pthread_mutex_unlock(&ctx.metadata_lock);
+    
+    /* Signal logger thread to shutdown */
+    pthread_mutex_lock(&ctx.log_buffer.mutex);
+    ctx.log_buffer.shutting_down = 1;
+    pthread_cond_broadcast(&ctx.log_buffer.not_empty);
+    pthread_mutex_unlock(&ctx.log_buffer.mutex);
+    
+    /* Join logger thread */
+    pthread_join(ctx.logger_thread, NULL);
+    
+    /* Destroy bounded buffer synchronization */
+    pthread_mutex_destroy(&ctx.log_buffer.mutex);
+    pthread_cond_destroy(&ctx.log_buffer.not_empty);
+    pthread_cond_destroy(&ctx.log_buffer.not_full);
+    
+    /* Cleanup container records */
+    pthread_mutex_lock(&ctx.metadata_lock);
+    rec = ctx.containers;
     while (rec != NULL) {
         container_record_t *next = rec->next;
         free(rec);
